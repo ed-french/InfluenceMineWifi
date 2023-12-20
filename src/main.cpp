@@ -12,20 +12,34 @@
 
       Requires a server endpoint that accepts its json message, and responds with updated parameters for its operation
 
+    The client sends:
+        {
+          "type":"TRIGGER",
+          "running_ms":2550589,
+          "calibration":[-439,-616,0],
+          "latest":[412,-106,-2],
+          "variance":1363,
+          "last_boot_reason":"Unknown%20reason",
+          "freshly_booted":false,
+          "last_tries_required":1,
+          "rssi":-33
+        }
+
 
       Typical server response:
 
-      {
-        "trigger_threshold":30,
-        "recalibration_interval_ms":600000,
-        "http_retries":3,
-        "drift_recalibration_threshold":10,
-        "wifi_connect_timeout_ms":45000,
-        "max_sleep_interval_ms":10000,
-        "reboot_now_flag":0,
-        "use_fake_sleep":1,
-        "stay_connected":0
-      }
+        {
+          "trigger_threshold":30,
+          "recalibration_interval_ms":600000,
+          "http_retries":3,
+          "drift_recalibration_threshold":10,
+          "wifi_connect_timeout_ms":45000,
+          "max_sleep_interval_ms":10000,
+          "recalibration_reading_count":40,
+          "reboot_now_flag":0,
+          "use_fake_sleep":1,
+          "stay_connected":0
+        }
 
       To do:
 
@@ -119,6 +133,9 @@ uint32_t g_s_recalibration_reading_count=100;
 bool g_s_reboot_flag=false;
 bool g_s_use_fake_sleep=true; // Was 
 bool g_s_stay_connected=true;
+
+
+bool g_server_running=false;
 
 
 
@@ -229,7 +246,7 @@ Reading get_mean_reading()
     xacc+=compass.m.x;
     yacc+=compass.m.y;
     zacc+=compass.m.z;
-    Serial.print("?");
+    Serial.print(i%10);
 
     delay(140); // Wait for new data
   }
@@ -317,7 +334,7 @@ void fake_sleep()
 void sleep_now()
 {
 
-  Serial.println("Going to sleep now");
+  //Serial.println("Going to sleep now");
 
   // pinMode(INTERRUPT_PIN, INPUT_PULLDOWN);
   // esp_deep_sleep_enable_gpio_wakeup(1 << INTERRUPT_PIN, ESP_GPIO_WAKEUP_GPIO_HIGH);
@@ -375,24 +392,26 @@ void signal_to_server_get_settings(const char * url)
           // Parse payload into g_s_ parameters
           DynamicJsonDocument doc(1024);
           deserializeJson(doc, payload);
-          uint16_t g_s_trigger_threshold=30;  // was g_threshold
-          uint32_t g_s_recalibration_interval_ms=doc["recalibration_interval_ms"];
-          uint8_t g_s_http_retries=doc["http_retries"];
-          uint8_t g_s_drift_recalibration_threshold=doc["drift_recalibration_threshold"];
-          uint32_t g_s_max_sleep_interval_ms=doc["max_sleep_interval_ms"];
-          uint32_t g_s_wifi_connect_timeout_ms=doc["wifi_connect_timeout_ms"]; // was WIFI_AT_BOOT_TIMEOUT
-          uint32_t g_s_recalibration_reading_count=doc["recalibration_reading_count"];
-          bool g_s_reboot_flag=(bool)doc["reboot_flag"];
-          bool g_s_use_fake_sleep=(bool)doc["use_fake_sleep"]; 
-          bool g_s_stay_connected_new=(bool)doc["stay_connected"];
+          g_s_trigger_threshold=30;  // was g_threshold
+          g_s_recalibration_interval_ms=doc["recalibration_interval_ms"];
+          g_s_http_retries=doc["http_retries"];
+          g_s_drift_recalibration_threshold=doc["drift_recalibration_threshold"];
+          g_s_max_sleep_interval_ms=doc["max_sleep_interval_ms"];
+          g_s_wifi_connect_timeout_ms=doc["wifi_connect_timeout_ms"]; // was WIFI_AT_BOOT_TIMEOUT
+          g_s_recalibration_reading_count=doc["recalibration_reading_count"];
+          g_s_reboot_flag=doc["reboot_flag"]==1;
+          g_s_use_fake_sleep=doc["use_fake_sleep"]==1; 
+          bool g_s_stay_connected_new=doc["stay_connected"]==1;
           if (g_s_stay_connected && !g_s_stay_connected_new)
           {
             // going offline, so shutdown the server stuff
 
             //ElegantOTA.end(); // No such function, hopefully it doesn't mind!
             server.end();
+            g_server_running=false;
             Serial.println("Server shut down now!");
           }
+          g_s_stay_connected=g_s_stay_connected_new;
 
 
           Serial.println("New settings:");
@@ -402,16 +421,16 @@ void signal_to_server_get_settings(const char * url)
           Serial.printf("\tdrift_recalibration_threshold=%d\n",g_s_drift_recalibration_threshold);
           Serial.printf("\tmax_sleep_interval_ms=%d\n",g_s_max_sleep_interval_ms);
           Serial.printf("\twifi_connect_timeout_ms=%d\n",g_s_wifi_connect_timeout_ms);
-          Serial.printf("\trecalibration_reading_count=%d",g_s_recalibration_reading_count);
+          Serial.printf("\trecalibration_reading_count=%d\n",g_s_recalibration_reading_count);
           Serial.printf("\treboot_flag=%d\n",g_s_reboot_flag);
           Serial.printf("\tuse_fake_sleep=%d\n",g_s_use_fake_sleep);
           Serial.printf("\tstay_connected=%d\n",g_s_stay_connected);
 
           if (g_s_reboot_flag)
           {
-            for (uint8_t i=20;i>0;i--)
+            for (uint8_t i=10;i>0;i--)
             {
-              Serial.printf("Going to reboot in %d seconds/n",i);
+              Serial.printf("Going to reboot in %d seconds\n",i);
               delay(1000);
             }
             esp_restart();
@@ -458,6 +477,7 @@ void setup_server(void)
   server.on("/",HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/plain", "This is the dawn light controller.\n"
                         "\t* Use /get_mag to return the current magnetic field strength\n"
+                        "\t* Use /reboot to reboot right away\n"
                         "\tUse /update to install new firmware remotely (creds wificlassic)\n");
   });
 
@@ -470,9 +490,16 @@ void setup_server(void)
         Serial.println(response);
   });
 
+  server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request)
+      {
+        esp_restart();
+      } 
+  );
+
   ElegantOTA.begin(&server);    // Start AsyncElegantOTA
   ElegantOTA.setAuth(ota_username,ota_password);
   server.begin();
+  g_server_running=true;
   Serial.println("HTTP server started");
 
 }
@@ -649,6 +676,11 @@ void wifi_off()
     Serial.println("Not switching off wifi as flag set to stay connected.");
     return;
   }
+  if (g_server_running)
+  {
+    server.end();
+    g_server_running=false;
+  }
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 }
@@ -706,7 +738,7 @@ void loop()
   {
     cycle_count++;
     // Consider recalibration (also repeated after each trigger)
-    if (random(0,7*60*60)<1 || millis()>next_calibration_due)
+    if (millis()>next_calibration_due)
     {
       g_mean_reading=get_mean_reading();
       next_calibration_due=millis()+g_s_recalibration_interval_ms;
@@ -783,11 +815,13 @@ void loop()
       // 
 
       
-
+      //printf("Considering using fake sleep: %d\n",g_s_use_fake_sleep);
       if (g_s_use_fake_sleep)
       {
+        //Serial.print("fake...");
         fake_sleep();
       } else {
+        //Serial.print("real...");
         sleep_now();
       }
       //
